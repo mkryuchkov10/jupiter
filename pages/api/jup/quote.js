@@ -1,136 +1,84 @@
-// pages/api/jup/quote.js
 import https from 'node:https';
 
 const ORIGIN_HOST = 'quote-api.jup.ag';
 const ORIGIN = `https://${ORIGIN_HOST}`;
 
-function sendWithDebug(res, status, body, extra = {}, hdrs = {}) {
-  const h = { 'content-type': 'application/json', ...hdrs };
-  Object.entries(extra).forEach(([k, v]) => h[`x-debug-${k}`] = String(v ?? ''));
-  res.writeHead(status, h);
-  res.end(body);
+function send(res, status, body, meta = {}, extraHeaders = {}) {
+  const headers = { 'content-type': 'application/json', ...extraHeaders };
+  for (const [k, v] of Object.entries(meta)) headers[`x-debug-${k}`] = String(v ?? '');
+  res.writeHead(status, headers); res.end(body);
 }
 
-async function dohA(name) {
-  const eps = [
-    `https://dns.google/resolve?name=${name}&type=A`,
-    `https://cloudflare-dns.com/dns-query?name=${name}&type=A`,
-    `https://1.1.1.1/dns-query?name=${name}&type=A`,
+async function dohAAll() {
+  const tries = [
+    ['google', 'https://dns.google/resolve?name=quote-api.jup.ag&type=A', {}],
+    ['cloudflare', 'https://cloudflare-dns.com/dns-query?name=quote-api.jup.ag&type=A', { accept: 'application/dns-json' }],
+    ['quad9', 'https://dns.quad9.net/dns-query?name=quote-api.jup.ag&type=A', { accept: 'application/dns-json' }],
+    ['opendns', 'https://doh.opendns.com/dns-query?name=quote-api.jup.ag&type=A', { accept: 'application/dns-json' }],
   ];
-  for (const url of eps) {
+  const results = [];
+  for (const [name, url, headers] of tries) {
     try {
-      const r = await fetch(url, { headers: { accept: 'application/dns-json' } });
-      const j = await r.json();
-      const ans = Array.isArray(j?.Answer) ? j.Answer : [];
-      const ips = ans.filter(a => a?.type === 1 && typeof a?.data === 'string').map(a => a.data);
-      if (ips.length) return { ips, src: url };
-    } catch { /* try next */ }
+      const r = await fetch(url, { headers, cache: 'no-store' });
+      const status = r.status;
+      const txt = await r.text();
+      let j; try { j = JSON.parse(txt); } catch { j = { raw: txt.slice(0, 600) }; }
+      const ips = (j?.Answer || []).filter(a => a?.type === 1 && typeof a?.data === 'string').map(a => a.data);
+      results.push({ source: name, status, ips, short: { Status: j?.Status, AD: j?.AD, AnswerLen: (j?.Answer || []).length } });
+    } catch (e) {
+      results.push({ source: name, error: String(e) });
+    }
   }
-  return { ips: [], src: 'none' };
+  const ips = results.flatMap(r => r.ips || []);
+  return { ips: Array.from(new Set(ips)), results };
 }
 
 function httpsGetByIp(ip, path) {
   return new Promise((resolve, reject) => {
-    const req = https.request(
-      {
-        protocol: 'https:',
-        hostname: ip,
-        port: 443,
-        method: 'GET',
-        path,
-        headers: {
-          Host: ORIGIN_HOST,
-          Accept: 'application/json',
-          'User-Agent': 'vercel-jup-proxy/1'
-        },
-        servername: ORIGIN_HOST, // важное: SNI
-      },
-      (res) => {
-        let data = '';
-        res.on('data', (c) => (data += c));
-        res.on('end', () => resolve({ status: res.statusCode || 502, headers: res.headers, body: data }));
-      }
-    );
-    req.on('error', reject);
-    req.end();
+    const req = https.request({
+      protocol: 'https:', hostname: ip, servername: ORIGIN_HOST, port: 443, method: 'GET', path,
+      headers: { Host: ORIGIN_HOST, Accept: 'application/json', 'User-Agent': 'vercel-jup-proxy/1' },
+    }, (res) => {
+      let data = ''; res.on('data', c => data += c); res.on('end', () => resolve({ status: res.statusCode || 502, headers: res.headers, body: data }));
+    });
+    req.on('error', reject); req.end();
   });
 }
 
 export default async function handler(req, res) {
   try {
-    if (!['GET', 'HEAD'].includes(req.method || '')) {
-      sendWithDebug(res, 405, JSON.stringify({ ok: false, error: 'Use GET' }));
-      return;
-    }
+    if (!['GET', 'HEAD'].includes(req.method || '')) return send(res, 405, JSON.stringify({ ok: false, error: 'Use GET' }));
 
     const url = new URL(req.url || '', `https://${req.headers.host}`);
-    const targetPath = `/v6/quote?${url.searchParams.toString()}`;
-    const target = `${ORIGIN}${targetPath}`;
+    const path = `/v6/quote?${url.searchParams.toString()}`;
+    const target = `${ORIGIN}${path}`;
     const started = Date.now();
 
-    // 1) Прямой запрос (нормальный путь)
+    // primary
     try {
       const r = await fetch(target, { method: 'GET', headers: { accept: 'application/json' }, cache: 'no-store' });
       const txt = await r.text();
-      sendWithDebug(
-        res,
-        r.status,
-        txt,
-        { phase: 'primary', duration_ms: Date.now() - started, target },
-        { 'cf-ray': r.headers.get('cf-ray') || '', server: r.headers.get('server') || '' }
-      );
-      return;
+      return send(res, r.status, txt, { phase: 'primary', duration_ms: Date.now() - started, target }, { 'cf-ray': r.headers.get('cf-ray') || '', server: r.headers.get('server') || '' });
     } catch (e) {
-      // если не DNS — отдаём сразу
-      const name = e?.name;
-      const code = e?.cause?.code || e?.code;
-      if (!String(code).includes('ENOTFOUND') && !String(code).includes('EAI_AGAIN')) {
-        sendWithDebug(
-          res,
-          502,
-          JSON.stringify({ ok: false, error: String(e), name, target, durationMs: Date.now() - started }),
-          { phase: 'primary_fail' }
-        );
-        return;
+      const cause = e?.cause || {};
+      if (!String(cause?.code).includes('ENOTFOUND') && !String(cause?.code).includes('EAI_AGAIN')) {
+        return send(res, 502, JSON.stringify({ ok: false, error: String(e), cause }), { phase: 'primary_fail', target, duration_ms: Date.now() - started });
       }
     }
 
-    // 2) Резерв: DoH -> IP -> HTTPS с SNI
-    const { ips, src } = await dohA(ORIGIN_HOST);
-    if (!ips.length) {
-      sendWithDebug(
-        res,
-        502,
-        JSON.stringify({ ok: false, error: 'DoH returned no A records', target, dohSrc: src }),
-        { phase: 'fallback_doh_empty', duration_ms: Date.now() - started }
-      );
-      return;
-    }
+    // DoH → IP+SNI
+    const doh = await dohAAll();
+    if (!doh.ips.length) return send(res, 502, JSON.stringify({ ok: false, error: 'DoH returned no A records', target, doh }), { phase: 'doh_empty', duration_ms: Date.now() - started });
 
-    let last;
-    for (const ip of ips) {
+    let lastErr = '';
+    for (const ip of doh.ips) {
       try {
-        const r = await httpsGetByIp(ip, targetPath);
-        sendWithDebug(
-          res,
-          r.status,
-          r.body,
-          { phase: 'fallback_ip', ip, dohSrc: src, duration_ms: Date.now() - started, target },
-          { 'cf-ray': r.headers['cf-ray'] || '', server: r.headers['server'] || '', 'content-type': r.headers['content-type'] || 'application/json' }
-        );
-        return;
-      } catch (e) {
-        last = String(e);
-      }
+        const r = await httpsGetByIp(ip, path);
+        return send(res, r.status, r.body, { phase: 'fallback_ip', ip, target, duration_ms: Date.now() - started }, { server: r.headers['server'] || '', 'content-type': r.headers['content-type'] || 'application/json' });
+      } catch (e) { lastErr = String(e); }
     }
-
-    sendWithDebug(
-      res,
-      502,
-      JSON.stringify({ ok: false, error: 'All IP attempts failed', lastError: last, ips, target, dohSrc: src }),
-      { phase: 'fallback_ip_fail', duration_ms: Date.now() - started }
-    );
+    return send(res, 502, JSON.stringify({ ok: false, error: 'All IP attempts failed', lastErr, ips: doh.ips, target, doh }), { phase: 'fallback_ip_fail', duration_ms: Date.now() - started });
   } catch (e) {
-    sendWithDebug(res, 502, JSON.stringify({ ok: false, error: String(e) }), { phase: 'handler_catch' });
+    return send(res, 502, JSON.stringify({ ok: false, error: String(e) }), { phase: 'handler_catch' });
   }
 }
