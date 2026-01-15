@@ -21,7 +21,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const body = await r.text()
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.status(r.status).send(body)
-  } catch (e: any) {
+  } catch (e: unknown) {
     res.status(500).json({ error: String(e) })
   }
 }
