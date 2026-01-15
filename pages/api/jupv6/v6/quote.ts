@@ -14,7 +14,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
   try {
     const params = new URLSearchParams(req.query as Record<string, string>).toString()
-    const url = `https://lite-api.jup.ag/swap/v1/quote?${params}`
+    const url = `https://api.jup.ag/swap/v1/quote?${params}`
     const headers: Record<string, string> = { accept: 'application/json' }
     if (process.env.JUP_API_KEY) headers['x-api-key'] = process.env.JUP_API_KEY
     const r = await fetch(url, { headers })

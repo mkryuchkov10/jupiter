@@ -19,7 +19,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
     if (process.env.JUP_API_KEY) headers['x-api-key'] = process.env.JUP_API_KEY
     const bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {})
-    const r = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+    const r = await fetch('https://api.jup.ag/swap/v1/swap', {
       method: 'POST',
       headers,
       body: bodyStr,
